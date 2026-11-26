@@ -1024,6 +1024,77 @@ static std::vector<float> get_logits(
     return ret;
 }
 
+static void test_dspark_padded_vocab() {
+    constexpr uint32_t n_vocab = 32;
+    constexpr uint32_t n_embd = 32;
+
+    for (const int64_t pad : {0, 1, 2}) {
+        const int64_t n_vocab_out = n_vocab + (pad == 2 ? pad : 0);
+        gguf_context_ptr gguf(gguf_init_empty());
+        kv_writer ms(LLM_ARCH_DFLASH, gguf.get());
+        ms.add_kv(LLM_KV_GENERAL_ARCHITECTURE,        "dflash");
+        ms.add_kv(LLM_KV_CONTEXT_LENGTH,              uint32_t(32));
+        ms.add_kv(LLM_KV_EMBEDDING_LENGTH,            n_embd);
+        ms.add_kv(LLM_KV_FEED_FORWARD_LENGTH,         n_embd);
+        ms.add_kv(LLM_KV_BLOCK_COUNT,                uint32_t(1));
+        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT,        uint32_t(1));
+        ms.add_kv(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, 1e-5f);
+        ms.add_kv(LLM_KV_DFLASH_BLOCK_SIZE,          uint32_t(3));
+        ms.add_kv(LLM_KV_TARGET_LAYERS,               std::vector<int32_t>{0});
+        ms.add_kv(LLM_KV_TOKENIZER_MODEL,             "test");
+        std::vector<std::string> tokens(n_vocab);
+        for (uint32_t i = 0; i < n_vocab; ++i) {
+            tokens[i] = "tok_" + std::to_string(i);
+        }
+        ms.add_kv(LLM_KV_TOKENIZER_LIST, tokens);
+
+        ggml_context_ptr tensors(ggml_init({128*1024, nullptr, false}));
+        const auto add = [&](const char * name, int64_t width, int64_t rows = 1) {
+            ggml_tensor * t = rows == 1 ? ggml_new_tensor_1d(tensors.get(), GGML_TYPE_F32, width)
+                                        : ggml_new_tensor_2d(tensors.get(), GGML_TYPE_F32, width, rows);
+            ggml_set_name(t, name);
+            memset(t->data, 0, ggml_nbytes(t));
+            gguf_add_tensor(gguf.get(), t);
+            return static_cast<float *>(t->data);
+        };
+        // The largest logical token wins each Markov step. Padding would win if sampled.
+        add("markov_w1.weight", 1, n_vocab + pad)[n_vocab - 1] = 1.0f;
+        float * w2 = add("markov_w2.weight", 1, n_vocab_out);
+        w2[n_vocab - 1] = 2.0f;
+        float * bias = add("markov_w2.bias", n_vocab + (pad == 2 ? 1 : 0));
+        bias[n_vocab - 1] = 3.0f;
+        if (pad == 2) {
+            w2[n_vocab] = 100.0f;
+            bias[n_vocab] = 100.0f;
+        }
+        add("token_embd.weight", n_embd, n_vocab_out);
+        add("output.weight", n_embd, n_vocab_out);
+        add("fc.weight", n_embd, n_embd);
+        add("enc.output_norm.weight", n_embd);
+        add("output_norm.weight", n_embd);
+        for (const char * name : {"attn_norm", "attn_q_norm", "attn_k_norm", "ffn_norm"}) {
+            add((std::string("blk.0.") + name + ".weight").c_str(), n_embd);
+        }
+        for (const char * name : {"attn_q", "attn_k", "attn_v", "attn_output", "ffn_gate", "ffn_up", "ffn_down"}) {
+            add((std::string("blk.0.") + name + ".weight").c_str(), n_embd, n_embd);
+        }
+
+        const std::string path = get_tmp_gguf_path();
+        GGML_ASSERT(gguf_write_to_file(gguf.get(), path.c_str(), false));
+        std::unique_ptr<FILE, decltype(&fclose)> file(fopen(path.c_str(), "rb"), fclose);
+        GGML_ASSERT(file);
+        auto [model, ctx] = get_model_and_ctx(nullptr, file.get(), 0, 0.0f, {});
+        const auto logits = get_logits(model.get(), ctx.get(), {n_vocab - 1, 0, 0});
+        ctx.reset();
+        model.reset();
+        file.reset();
+        std::filesystem::remove(path);
+        std::vector<float> expected(3*n_vocab, 0.0f);
+        expected[n_vocab - 1] = expected[2*n_vocab - 1] = expected[3*n_vocab - 1] = 5.0f;
+        GGML_ASSERT(logits == expected);
+    }
+}
+
 // entries [n/4, n/2) are embd rows, decoded either as token/embd/token chunks or as one mixed batch
 // returns the llama_process() error code
 static int32_t get_logits_mixed(
@@ -1500,7 +1571,12 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
         if (!arch_matches(arch_filter, arch)) {
             continue;
         }
-        if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+        if (arch == LLM_ARCH_DFLASH) {
+            test_dspark_padded_vocab();
+            ++n_tests;
+            continue;
+        }
+        if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
             continue;
         }
 

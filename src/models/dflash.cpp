@@ -88,12 +88,19 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     type = LLM_TYPE_UNKNOWN;
 }
 
+int64_t llama_model_dflash::vocab_tensor_size(const LLM_TN_IMPL & tn, int dim) const {
+    const int64_t n_vocab = vocab.n_tokens();
+    const auto * meta = ml->get_tensor_meta(tn.str().c_str());
+    return meta ? std::max(n_vocab, meta->ne[dim]) : n_vocab;
+}
+
 void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
     LLAMA_LOAD_LOCALS;
 
     const int64_t n_embd_inp = hparams.n_embd_inp_enc();
 
-    tok_embd        = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD,       "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
+    const auto tn_embd = tn(LLM_TENSOR_TOKEN_EMBD, "weight");
+    tok_embd = create_tensor(tn_embd, { n_embd, vocab_tensor_size(tn_embd) }, TENSOR_NOT_REQUIRED);
 
     // reduced draft vocab (optional): d2t maps draft rows to target token ids
     int64_t n_vocab_draft = n_vocab;
@@ -125,7 +132,9 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
 
     // optional: reduced-vocab drafts ship their own lm head, full-vocab drafts can share the target's via ctx_other
     // a draft with its own embeddings + head references no target tensors and can run on devices the target does not use (e.g. -devd with a tensor-split target)
-    output   = create_tensor(tn(LLM_TENSOR_OUTPUT,     "weight"), { n_embd, n_vocab_draft }, TENSOR_NOT_REQUIRED);
+    const auto tn_output = tn(LLM_TENSOR_OUTPUT, "weight");
+    const int64_t n_vocab_out = d2t ? n_vocab_draft : vocab_tensor_size(tn_output);
+    output = create_tensor(tn_output, { n_embd, n_vocab_out }, TENSOR_NOT_REQUIRED);
 
     switch (backbone) {
         case BACKBONE_BASE:           load_tensors_layers_base();           break;
@@ -266,16 +275,25 @@ ggml_tensor * llama_model_dflash::get_tok_embd(const llm_graph_context & g, cons
     return model_other->tok_embd;
 }
 
-// lm_head and its scale from the target model (shared via ctx_other) when the draft has none
-std::pair<ggml_tensor *, ggml_tensor *> llama_model_dflash::get_lm_head(const llm_graph_context & g, const llama_model & model) {
-    if (model.output) {
-        return { model.output, model.output_s };
+ggml_tensor * llama_model_dflash::build_lm_head(const llm_graph_context & g, const llama_model & model, ggml_tensor * cur) {
+    const llama_model * model_head = &model;
+    if (!model.output) {
+        GGML_ASSERT(g.cparams.ctx_other != nullptr);
+        model_head = llama_get_model(g.cparams.ctx_other);
+        GGML_ASSERT(model_head->output != nullptr && "DFlash draft requires the target model's output projection");
     }
-    GGML_ASSERT(g.cparams.ctx_other != nullptr);
-    const auto * model_other = llama_get_model(g.cparams.ctx_other);
 
-    GGML_ASSERT(model_other->output != nullptr && "DFlash draft requires the target model's output projection");
-    return { model_other->output, model_other->output_s };
+    const int64_t n_vocab = model.vocab.n_tokens();
+    if (!model.d2t && model_head->output->ne[1] < n_vocab) {
+        throw std::runtime_error("DFlash output projection has fewer rows than the draft vocabulary");
+    }
+    cur = g.build_lora_mm(model_head->output, cur, model_head->output_s);
+
+    // A padded LM head can come from either the draft or the target.
+    if (!model.d2t && cur->ne[0] > n_vocab) {
+        cur = ggml_cont(g.ctx0, ggml_view_2d(g.ctx0, cur, n_vocab, cur->ne[1], cur->nb[1], 0));
+    }
+    return cur;
 }
 
 // DFlash decoder, dual-mode by batch type:
@@ -555,13 +573,7 @@ ggml_tensor * llama_model_dflash::graph_base::build_layers(ggml_tensor * inp_tok
 }
 
 ggml_tensor * llama_model_dflash::graph_base::build_logits(ggml_tensor * cur) {
-    const auto [output, output_s] = get_lm_head(*this, model);
-    cur = build_lora_mm(output, cur, output_s);
-
-    // a padded lm head (e.g. shared from the target): drop the rows past the vocabulary
-    if (!model.d2t && cur->ne[0] > (int64_t) model.vocab.n_tokens()) {
-        cur = ggml_cont(ctx0, ggml_view_2d(ctx0, cur, model.vocab.n_tokens(), cur->ne[1], cur->nb[1], 0));
-    }
+    cur = build_lm_head(*this, model, cur);
 
     // DFlash2 feeds these logits to the selector, so they need the target's output
     // transforms; DFlash1 and DSpark read them through the sampler instead

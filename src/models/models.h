@@ -1660,6 +1660,7 @@ struct llama_model_dflash : public llama_model_base {
     void load_tensors_layers_base();
     void load_tensors_layers_dsv4();
     void load_tensors_layers_mistral_large4();
+    int64_t vocab_tensor_size(const LLM_TN_IMPL & tn, int dim = 1) const;
 
     template <bool is_enc>
     struct graph : public llm_graph_context {
@@ -1723,7 +1724,7 @@ struct llama_model_dflash : public llama_model_base {
     // graph helpers shared by the backbones
     static ggml_tensor * build_inject_inp(llm_graph_context & g, const llama_model & model);
     static ggml_tensor * get_tok_embd(const llm_graph_context & g, const llama_model & model);
-    static std::pair<ggml_tensor *, ggml_tensor *> get_lm_head(const llm_graph_context & g, const llama_model & model);
+    static ggml_tensor * build_lm_head(const llm_graph_context & g, const llama_model & model, ggml_tensor * cur);
 
     // DFlash2 local conv, run by the base layers of DFlash2 and LiliCorr drafts
     static ggml_tensor * build_dflash2_conv(llm_graph_context & g, ggml_tensor * hidden, ggml_tensor * dynamic, ggml_tensor * base, int side);

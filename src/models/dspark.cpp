@@ -79,12 +79,17 @@ void llama_model_dflash::load_hparams_mistral_large4(llama_model_loader & ml) {
 void llama_model_dflash::load_tensors_dspark(int64_t n_vocab_draft) {
     LLAMA_LOAD_LOCALS;
 
-    const int64_t dspark_markov_rank = ml->get_tensor_meta("markov_w1.weight")->ne[0];
+    const auto tn_w1   = tn(LLM_TENSOR_DSPARK_MARKOV_W1, "weight");
+    const auto tn_w2   = tn(LLM_TENSOR_DSPARK_MARKOV_W2, "weight");
+    const auto tn_w2_b = tn(LLM_TENSOR_DSPARK_MARKOV_W2, "bias");
+    const int64_t dspark_markov_rank = ml->require_tensor_meta(tn_w1.str())->ne[0];
+    const int64_t n_vocab_w2   = d2t ? n_vocab_draft : vocab_tensor_size(tn_w2);
+    const int64_t n_vocab_w2_b = d2t ? n_vocab_draft : vocab_tensor_size(tn_w2_b, 0);
 
-    dspark_markov_w1   = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W1, "weight"), { dspark_markov_rank, n_vocab }, 0);
-    dspark_markov_w2   = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W2, "weight"), { dspark_markov_rank, n_vocab_draft }, 0);
+    dspark_markov_w1   = create_tensor(tn_w1, { dspark_markov_rank, vocab_tensor_size(tn_w1) }, 0);
+    dspark_markov_w2   = create_tensor(tn_w2, { dspark_markov_rank, n_vocab_w2 }, 0);
     dspark_markov_w2_s = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W2, "scale"),  { 1 }, TENSOR_NOT_REQUIRED);
-    dspark_markov_w2_b = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W2, "bias"),   { n_vocab_draft }, TENSOR_NOT_REQUIRED);
+    dspark_markov_w2_b = create_tensor(tn_w2_b, { n_vocab_w2_b }, TENSOR_NOT_REQUIRED);
 
     dspark_conf_proj   = create_tensor(tn(LLM_TENSOR_DSPARK_CONF_PROJ, "weight"), { n_embd + dspark_markov_rank, 1 }, TENSOR_NOT_REQUIRED);
     dspark_conf_proj_b = create_tensor(tn(LLM_TENSOR_DSPARK_CONF_PROJ, "bias"),   { 1 },             TENSOR_NOT_REQUIRED);
@@ -379,9 +384,15 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
             markov = ggml_tanh(ctx0, chunk(2));
         }
 
-        ggml_tensor * bias = g.build_lora_mm(w2, markov, model.dspark_markov_w2_s); // [n_vocab_draft, n_blocks]
-        if (model.dspark_markov_w2_b) {
-            bias = ggml_add(ctx0, bias, model.dspark_markov_w2_b);
+        ggml_tensor * bias = g.build_lora_mm(w2, markov, model.dspark_markov_w2_s);
+        if (!model.d2t && bias->ne[0] > n_vocab) {
+            bias = ggml_cont(ctx0, ggml_view_2d(ctx0, bias, n_vocab, n_blocks, bias->nb[1], 0));
+        }
+        if (ggml_tensor * w2_b = model.dspark_markov_w2_b) {
+            if (!model.d2t && w2_b->ne[0] > n_vocab) {
+                w2_b = ggml_view_1d(ctx0, w2_b, n_vocab, 0);
+            }
+            bias = ggml_add(ctx0, bias, w2_b);
         }
         if (model.d2t) {
             // reduced draft vocab: scatter the bias to the target rows (base is -inf on the others)
@@ -628,8 +639,7 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llm_graph_params & params) :
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);
 
-    const auto [output, output_s] = get_lm_head(*this, model);
-    cur = build_lora_mm(output, cur, output_s);
+    cur = build_lm_head(*this, model, cur);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
@@ -833,8 +843,7 @@ llama_model_dflash::graph_dsv41::graph_dsv41(const llm_graph_params & params) :
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);
 
-    const auto [output, output_s] = get_lm_head(*this, model);
-    cur = build_lora_mm(output, cur, output_s);
+    cur = build_lm_head(*this, model, cur);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
@@ -994,8 +1003,7 @@ llama_model_dflash::graph_mistral_large4::graph_mistral_large4(const llm_graph_p
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    const auto [output, output_s] = get_lm_head(*this, model);
-    ggml_tensor * logits = build_lora_mm(output, cur, output_s);
+    ggml_tensor * logits = build_lm_head(*this, model, cur);
 
     // softcap does not apply to the markov bias
     if (hparams.f_final_logit_softcapping) {
